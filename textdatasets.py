@@ -16,6 +16,7 @@ MAX_SEQUENCE_LENGTH = 10
 DEBUG = True
 DEBUG_DATA_LENGTH = 100
 
+
 class ANNBasedTripletSelector:
 
     def get_embeddings(self):
@@ -36,7 +37,6 @@ class ANNBasedTripletSelector:
                 embedding_matrix[i] = embedding_vector
         self.idx_to_embedding = embedding_matrix
 
-
     def build_word_to_idx(self):
         unique_words = set()
         self.word2idx = {}
@@ -50,7 +50,6 @@ class ANNBasedTripletSelector:
             self.word2idx[word] = i
             i += 1
 
-
     def convert_entity_to_sequence(self, entity):
         words = entity.split()
 
@@ -63,8 +62,8 @@ class ANNBasedTripletSelector:
         if len(words) < MAX_SEQUENCE_LENGTH:
             for i in range(len(words), MAX_SEQUENCE_LENGTH):
                 sequence.append(np.zeros(EMBEDDING_DIM))
-
-        return torch.from_numpy(np.asarray(sequence))
+        X = np.asarray(sequence)
+        return torch.from_numpy(X).float()
 
     def get_entities_as_sequence(self, ents):
         sequences = []
@@ -219,13 +218,13 @@ class ANNBasedTripletSelector:
         self.entities = []
         ents = self.read_entities(filename)
         self.train, self.test = self.split(ents)
-        entity2same_train = self.generate_names(self.train)
-        entity2same_test = self.generate_names(self.test, limit_pairs=True)
-        print(len(entity2same_train))
-        print(len(entity2same_test))
+        self.entity2same_train = self.generate_names(self.train)
+        self.entity2same_test = self.generate_names(self.test, limit_pairs=True)
+        print(len(self.entity2same_train))
+        print(len(self.entity2same_test))
 
-        self.get_all_entities(entity2same_train)
-        self.get_all_entities(entity2same_test)
+        self.get_all_entities(self.entity2same_train)
+        self.get_all_entities(self.entity2same_test)
 
         self.word2idx = {}
         self.build_word_to_idx()
@@ -234,24 +233,27 @@ class ANNBasedTripletSelector:
         self.get_embeddings()
 
         # build a set of data structures useful for annoy, the set of unique entities (unique_text),
-        # a mapping of entities in texts to an index in unique_text, a mapping of entities to other same entities, and the actual
+        # a mapping of entities in texts to an index in unique_text, a mapping of entities to other same entities,
+        # and the actual
         # vectorized representation of the text.  These structures will be used iteratively as we build up the model
         # so we need to create them once for re-use
-        unique_text_train, entity2unique_train = self.build_unique_entities(entity2same_train)
-        unique_text_test, entity2unique_test = self.build_unique_entities(entity2same_test)
+        self.unique_text_train, self.entity2unique_train = self.build_unique_entities(self.entity2same_train)
+        self.unique_text_test, self.entity2unique_test = self.build_unique_entities(self.entity2same_test)
 
-        print("train text len:" + str(len(unique_text_train)))
-        print("test text len:" + str(len(unique_text_test)))
+        print("train text len:" + str(len(self.unique_text_train)))
+        print("test text len:" + str(len(self.unique_text_test)))
 
-        test_seq = self.get_entities_as_sequence(unique_text_test)
-        test_data, test_match_stats = self.generate_triplets_from_ann(test_seq, entity2unique_test, entity2same_test, unique_text_test, False)
+        self.train_seq = self.get_entities_as_sequence(self.unique_text_train)
+        train_data, match_stats = self.generate_triplets_from_ann(self.train_seq, self.entity2unique_train,
+                                                                  self.entity2same_train, self.unique_text_train, False)
+        self.train_data = self.get_tensors(train_data)
+        print("Train stats:" + str(match_stats))
+
+        self.test_seq = self.get_entities_as_sequence(self.unique_text_test)
+        test_data, test_match_stats = self.generate_triplets_from_ann(self.test_seq, self.entity2unique_test,
+                                                                      self.entity2same_test, self.unique_text_test, False)
         self.test_data = self.get_tensors(test_data)
         print("Test stats:" + str(test_match_stats))
-
-        train_seq = self.get_entities_as_sequence(unique_text_train)
-        train_data, match_stats = self.generate_triplets_from_ann(train_seq, entity2unique_train, entity2same_train, unique_text_train, False)
-        self.train_data = self.get_tensors(train_data)
-        print("Match stats:" + str(match_stats))
 
     def get_test_data(self):
         return self.test_data
@@ -259,26 +261,66 @@ class ANNBasedTripletSelector:
     def get_train_data(self):
         return self.train_data
 
+    def get_train_dataset(self):
+        return TextDataset(self.train_seq, True)
+
+    def get_test_dataset(self):
+        return TextDataset(self.test_seq, False)
+
+    def get_nn_stats(self, embeddings, train):
+        if train:
+            _, match_stats = self.generate_triplets_from_ann(embeddings, self.entity2unique_train,
+                                                             self.entity2same_train, self.unique_text_train, False)
+        else:
+            match_stats = self.generate_triplets_from_ann(embeddings, self.entity2unique_test,
+                                                             self.entity2same_test, self.unique_text_test, True)
+        return match_stats
+
+
+class TextDataset(Dataset):
+    def __init__(self, text_data, train):
+        self.train = train
+        if train:
+            self.train_data = text_data
+        else:
+            self.test_data = text_data
+
+    def __getitem__(self, index):
+        if self.train:
+            t = self.train_data
+        else:
+            t = self.test_data
+        return t[index].unsqueeze(0)
+
+    def __len__(self):
+        if self.train:
+            t = self.train_data
+        else:
+            t = self.test_data
+        return len(t)
+
+
 class TripletDataset(Dataset):
     def __init__(self, triplet_selector, train):
         self.dataset = triplet_selector
         self.train = train
         if train:
-            self.train = triplet_selector.get_train_data()
+            self.train_data = triplet_selector.get_train_data()
         else:
-            self.test = triplet_selector.get_test_data()
+            self.test_data = triplet_selector.get_test_data()
 
     def __getitem__(self, index):
-
         if self.train:
-            t = self.train
+            t = self.train_data
         else:
-            t = self.test
+            t = self.test_data
         return (t['anchor'][index], t['positive'][index], t['negative'][index]), []
 
     def __len__(self):
         if self.train:
-            t = self.train
+            t = self.train_data
         else:
-            t = self.test
+            t = self.test_data
         return len(t)
+
+
